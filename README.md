@@ -1,6 +1,6 @@
 # gitbrute-rs
 
-rust clone of gitbrute.go
+Rust clone of gitbrute.go
 
 ```
 USAGE:
