@@ -11,3 +11,7 @@ num_cpus = "1"
 regex = "1"
 rust-crypto = "0.2"
 rustc-hex = "2"
+
+[[bin]]
+name = "gitbrute-rs"
+path = "main.rs"
