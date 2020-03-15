@@ -1,6 +1,11 @@
 # gitbrute-rs
 
-Rust clone of gitbrute.go
+Rust clone of gitbrute.go.
+
+It adds two new features:
+
+- Timezone modifications try to change the timezone information before starting to also change the times.
+- Partial patterns are useful if you only want to specify a few bits in a nibble.
 
 ```
 USAGE:
