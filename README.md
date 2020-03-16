@@ -1,6 +1,6 @@
 # gitbrute-rs
 
-Rust clone of gitbrute.go.
+Rust clone of https://github.com/bradfitz/gitbrute
 
 It adds two new features:
 
