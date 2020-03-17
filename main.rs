@@ -157,74 +157,78 @@ fn cur_hash() -> Result<String, std::io::Error> {
         Ok(String::from_utf8(cmd.stdout).map_err(|e| errmap("", &e))?.trim().to_owned())
 }
 
+#[derive(Debug)]
+struct SplitInt<T> {
+	i1: T,
+	i2: T,
+}
+
+trait Zero {
+	fn zero() -> Self;
+}
+
+trait Inc {
+	fn inc(&mut self) -> ();
+}
+
+impl <T: Zero> Zero for SplitInt<T> {
+	fn zero() -> Self {
+		SplitInt{i1: T::zero(), i2: T::zero()}
+	}
+}
+
+impl <T: Inc + Zero + Clone + PartialOrd> Inc for SplitInt<T> {
+	fn inc(&mut self) -> () {
+		let mut i1inc = self.i1.clone();
+		i1inc.inc();
+		if i1inc < self.i2 {
+			self.i1.inc();
+		} else if self.i2 < self.i1 {
+			self.i2.inc();
+		} else if self.i1 < self.i2 {
+			self.i1.inc();
+			self.i2 = T::zero();
+		} else {
+			self.i1 = T::zero();
+			self.i2.inc();
+		}
+	}
+}
+
+impl Zero for u64 {
+	fn zero() -> Self { 0 }
+}
+
+impl Inc for u64 {
+	fn inc(&mut self) { *self += 1; }
+}
+
 fn possibilities(mut possibilities_tx: spmc::Sender<Possibility>, timezone: bool, timezone_minutes: bool, force: bool, done: (std::sync::Arc<std::sync::atomic::AtomicBool>, std::sync::Arc<std::sync::atomic::AtomicI32>)) {
         let mut generated = 0;
-        let tzpossibilities: Vec<i32> =
-                if timezone_minutes {
-                        (1..12*60*2) // every minute for both hemispheres, but including 0 only once
-                                .into_iter()
-                                .map(|t| if t % 2 == 0 { 1 } else { -1 } * (t / 2))
-                                .collect()
-                } else if timezone {
-                        (1..12*4*2) // every 15 minutes for both hemispheres, but including 0 only once
-                                .into_iter()
-                                .map(|t| if t % 2 == 0 { 1 } else  { -1 } * (t / 2))
-                                .map(|t| t * 15)
-                                .collect()
-                } else {
-                        vec![0] // don't touch the timezone
-                };
+	let mut possibility_counter = SplitInt::<u64>::zero();
+	if force {
+		possibility_counter.i1.inc();
+	}
 
-        let mut possibilities = std::collections::VecDeque::new();
-        possibilities.push_back((0i32, if force { 1i32 } else { 0i32 }));
+	'main:
+	loop {
+		let ao = Offset::from_u64(possibility_counter.i1, timezone, timezone_minutes);
+		let co = Offset::from_u64(possibility_counter.i2, timezone, timezone_minutes);
+		let next_possibility = Possibility{serial: generated, author: ao, committer: co};
 
-        'main:
-        while let Some((ad, cd)) = possibilities.pop_front() {
-                for atz in tzpossibilities.iter() {
-                        for ctz in tzpossibilities.iter() {
-                                let ao = Offset{time_offset: ad, timezone_offset: *atz};
-                                let co = Offset{time_offset: cd, timezone_offset: *ctz};
-                                let next_possibility = Possibility{serial: generated, author: ao, committer: co};
-                                if possibilities_tx.send(next_possibility).is_err() || done.0.load(std::sync::atomic::Ordering::SeqCst) {
-                                        break 'main;
-                                } else {
-                                        generated += 1;
-                                        let val = done.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                                        if  val > 10000 {
-                                                std::thread::sleep(std::time::Duration::from_millis(val as u64 / 10000));
-                                                //println!("Overload! {}", val);
-                                        }
-                                }
-                        }
-                }
-                if ad == 0 && cd == 0 || ad >= 0 && cd > 0  || ad > 0 && cd >= 0 {
-                        // only generate new values for the "main" path, that is the non-negative pairs
-                        fn pm(i: i32) -> Vec<i32> {
-                                vec![i, -i]
-                        }
-                        let (ad, cd) =
-                                if ad + 1 < cd {
-                                        (pm(ad + 1), pm(cd))
-                                } else if cd + 1 < ad {
-                                        (pm(ad), pm(cd + 1))
-                                } else if ad < cd {
-                                        (pm(ad + 1), vec![0])
-                                } else if ad == cd {
-                                        (vec![0], pm(cd + 1))
-                                } else {
-                                        assert!(ad == cd + 1);
-                                        (pm(ad), pm(cd + 1))
-                                };
-                        for ad in ad.iter() {
-                                for cd in cd.iter() {
-                                        possibilities.push_back((*ad, *cd));
-                                }
-                        }
-                        if possibilities.len() > 100 {
-                                println!("queue length: {}", possibilities.len());
-                        }
-                }
-        }
+		if possibilities_tx.send(next_possibility).is_err() || done.0.load(std::sync::atomic::Ordering::SeqCst) {
+			break 'main;
+		} else {
+			generated += 1;
+			let val = done.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+			if  val > 10000 {
+				std::thread::sleep(std::time::Duration::from_millis(val as u64 / 10000));
+				//println!("Overload! {}", val);
+			}
+		}
+
+		possibility_counter.i1.inc();
+	}
 }
 
 #[derive(Debug)]
@@ -233,11 +237,39 @@ struct Solution {
         author: String,
         committer: String,
 }
+
 #[derive(Debug)]
 struct Offset {
         time_offset: i32,
         timezone_offset: i32,
 }
+
+const TZMOD: u64 = 1+(12*60-1)*2; // {zero} U {+/- almost twelve hours}
+const TZMODQ: u64 = 1+(12*4-1)*2; // {zero} U {+/- almost twelve hours in quarter hour steps}
+impl Offset {
+	fn from_u64(v: u64, timezone: bool, timezone_minutes: bool) -> Offset {
+		let (modulus, tzmultiplier) =
+			if timezone_minutes {
+				(TZMOD, 1)
+			} else if timezone {
+				(TZMODQ, 15)
+			} else {
+				(1, 1)
+			};
+			
+		let tz = (v + 1) % modulus;
+		let t  = (v + 1) / modulus;
+		fn parity_sign(v: u64) -> i32 {
+			if v % 2 == 0 {
+				(v >> 1) as i32
+			} else {
+				-((v >> 1) as i32)
+			}
+		}
+		Offset{time_offset: parity_sign(t), timezone_offset: parity_sign(tz)*tzmultiplier}
+	}
+}
+
 #[derive(Debug)]
 struct Possibility {
         serial: u64,
@@ -284,16 +316,52 @@ fn brute_force(obj: Vec<u8>, winner_tx: std::sync::mpsc::Sender<Solution>, possi
         let (cd_base, cdtz_base) = parse_date(committer_date);
         let mut cdlen = committer_date.len();
 
-        fn tzformat(base_mins: i32, offset: i32) -> String {
+	fn tzadd(base_mins: i32, offset: i32) -> i32 {
                 let mut res = base_mins + offset;
                 if res < -12*60 {
                         res = 12*60 + (res + 12*60);
                 } else if res > 12*60 {
                         res = -12*60 + (res - 12*60); 
                 }
-                let pres = res.abs();
-                format!("{}{:0>2}{:0>2}", if res < 0 { '-' } else { '+' }, pres / 60, pres % 60)
+		res
+	}
+
+        fn tzformat(tz: i32) -> String {
+                let ptz = tz.abs();
+                format!("{}{:0>2}{:0>2}", if tz < 0 { '-' } else { '+' }, ptz / 60, ptz % 60)
         }
+
+	fn inplace_format(dest: &mut [u8], mut time: i64, mut tz: i32) -> Result<(), ()> {
+		let sign = if tz < 0 { b'-' } else { b'+' };
+		tz = tz.abs();
+
+		for i in 0..dest.len() {
+			       if i == dest.len() - 1 {
+				dest[i] = b'0' + (tz % 10) as u8;
+			} else if i == dest.len() - 2 {
+				dest[i] = b'0' + (tz % 60 / 10) as u8;
+			} else if i == dest.len() - 3 {
+				dest[i] = b'0' + (tz / 60 % 10) as u8;
+			} else if i == dest.len() - 4 {
+				dest[i] = b'0' + (tz / 60 / 10) as u8;
+			} else if i == dest.len() - 5 {
+				dest[i] = sign;
+			} else if i == dest.len() - 6 {
+			} else {
+				if time == 0 {
+					return Err(());
+				}
+				dest[dest.len() - i - 7] = b'0' + (time % 10) as u8;
+				time /= 10;
+			}
+		}
+
+		if time != 0 {
+			Err(())
+		} else {
+			Ok(())
+		}
+	}
 
         let mut s1 = crypto::sha1::Sha1::new();
         let mask: Vec<u8> = make_mask(prefixbits);
@@ -305,28 +373,31 @@ fn brute_force(obj: Vec<u8>, winner_tx: std::sync::mpsc::Sender<Solution>, possi
         }
 
         //fn dump(tag: &str, b: &[u8]) { println!("{}: >{}<", tag, std::str::from_utf8(b).unwrap()); }
+	let mut ad = format!("{} {}", ad_base, tzformat(tzadd(adtz_base, 0))).into_bytes();
+	let mut cd = format!("{} {}", cd_base, tzformat(tzadd(cdtz_base, 0))).into_bytes();
         while let Ok(p) = possibilities_rx.recv() {
                 done.1.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 //println!("trying {:?}", p);
                 if ad_base + (p.author.time_offset as i64) < 0 || cd_base + (p.committer.time_offset as i64) < 0 {
                         continue;
                 }
-                let ads = format!("@{} {}", ad_base + p.author.time_offset as i64, tzformat(adtz_base, p.author.timezone_offset));
-                let ad = &ads.as_bytes()[1..];
-                let cds = format!("@{} {}", cd_base + p.committer.time_offset as i64, tzformat(cdtz_base, p.committer.timezone_offset));
-                let cd = &cds.as_bytes()[1..];
+		if inplace_format(&mut ad, ad_base + p.author.time_offset as i64, tzadd(adtz_base, p.author.timezone_offset)).is_err() ||
+			inplace_format(&mut cd, cd_base + p.committer.time_offset as i64, tzadd(cdtz_base, p.committer.timezone_offset)).is_err() {
+			ad = format!("{} {}", ad_base + p.author.time_offset as i64, tzformat(tzadd(adtz_base, p.author.timezone_offset))).into_bytes();
+			cd = format!("{} {}", cd_base + p.committer.time_offset as i64, tzformat(tzadd(cdtz_base, p.committer.timezone_offset))).into_bytes();
+		}
 
                 if ad.len() == adlen && cd.len() == cdlen {
-                        splice(&mut blob, cdatei, cd);
-                        splice(&mut blob, adatei, ad);
+                        splice(&mut blob, cdatei, &cd);
+                        splice(&mut blob, adatei, &ad);
                 } else {
                         //dump("extending blob", &blob);
 
-                        let objlen: usize = vec![before_author_date, ad, between_dates, cd, after_committer_date].into_iter().map(|s| s.len()).sum();
+                        let objlen: usize = vec![before_author_date, &ad, between_dates, &cd, after_committer_date].into_iter().map(|s| s.len()).sum();
                         intro = format!("commit {}\0", objlen).as_bytes().to_owned();
 
                         blob = Vec::with_capacity(objlen + intro.len());
-                        for s in vec![&intro as &[u8], before_author_date, ad, between_dates, cd, after_committer_date] {
+                        for s in vec![&intro as &[u8], before_author_date, &ad, between_dates, &cd, after_committer_date] {
                                 blob.extend_from_slice(s);
                         }
 
@@ -353,7 +424,7 @@ fn brute_force(obj: Vec<u8>, winner_tx: std::sync::mpsc::Sender<Solution>, possi
                 }
 
                 if matches_with_mask(&hash, &prefixbin, &mask) {
-                        let winner = Solution{generated: p.serial, author: ads, committer: cds};
+                        let winner = Solution{generated: p.serial, author: format!("@{}", String::from_utf8(ad).unwrap()), committer: format!("@{}", String::from_utf8(cd).unwrap())};
                         //println!("winner found: {:?}", winner);
                         winner_tx.send(winner).expect("failed to send result");
                         break;
