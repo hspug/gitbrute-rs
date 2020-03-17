@@ -67,19 +67,14 @@ fn main() -> Result<(), std::io::Error> {
                 .unwrap_or(num_cpus::get());
 
         if !force {
-                let hash: Vec<u8> = {use rustc_hex::FromHex; cur_hash()?.from_hex().map_err(|e| errmap("HEAD hash parse", &e))?};
+                let hash: Vec<u8> = {use rustc_hex::FromHex; cur_hash(verbose).map_err(|e| errmap("Current hash", &e))?.from_hex().map_err(|e| errmap("HEAD hash parse", &e))?};
                 let mask = make_mask(prefixbits);
                 if matches_with_mask(&hash, &prefixbin, &mask) {
                         return Ok(());
                 }
         }
 
-        let obj = std::process::Command::new("git").args(&["cat-file", "-p", "HEAD"]).output()?;
-        if !obj.status.success() {
-                panic!("Failed to load git object.");
-        }
-
-        let obj = obj.stdout;
+        let obj = git(verbose, &["cat-file", "-p", "HEAD"]).map_err(|e| errmap("failed to load git object for HEAD", &e))?;
 
 	let mut pi = PossibilityIterator{
 			serial: 0,
@@ -92,7 +87,6 @@ fn main() -> Result<(), std::io::Error> {
 	}
         let shared = std::sync::Arc::new((
 		std::sync::atomic::AtomicBool::new(false),
-		std::sync::atomic::AtomicI32::new(0),
 		std::sync::Mutex::new(pi),
 	));
 
@@ -120,19 +114,40 @@ fn main() -> Result<(), std::io::Error> {
                 f.join().map_err(|e| errmap("forcer join", &format!("{:?}", e)))?;
         }
 
-        let cmd =
-                std::process::Command::new("git").args(&["commit", "--allow-empty", "--amend", &format!("--date={}", w.author), "--reuse-message=HEAD"])
-                .env("GIT_COMMITTER_DATE", w.committer)
-                .output()?;
+	git_env(verbose, &["commit", "--allow-empty", "--amend", &format!("--date={}", w.author), "--reuse-message=HEAD"], &vec![("GIT_COMMITTER_DATE".to_owned(), w.committer)]).map_err(|s| errmap("Failed to amend git object.", &s))?;
 
-        if !cmd.status.success() {
-                Err(errmap("", &format!("Failed to amend git object: {}: {:?}", cmd.status, String::from_utf8(cmd.stdout))))
-        } else {
-                if verbose {
-                        println!("new hash: {}", cur_hash()?);
-                }
-                Ok(())
-        }
+	if verbose {
+		println!("new hash: {}", cur_hash(verbose).map_err(|e| errmap("new hash", &e))?);
+	}
+	Ok(())
+}
+
+fn git(verbose: bool, args: &[&str]) -> Result<Vec<u8>, String> {
+	git_env(verbose, args, &vec![])
+}
+
+fn git_env(verbose: bool, args: &[&str], envs: &[(String, String)]) -> Result<Vec<u8>, String> {
+	if verbose {
+		println!("executing git{}", args.iter().fold("".to_owned(), |a, e| format!("{} '{}'", a, e)));
+	}
+
+        let mut obj = std::process::Command::new("git");
+	let mut obj = obj.args(args);
+	for env in envs {
+		obj = obj.env(env.0.clone(), env.1.clone());
+	}
+	let obj = obj.output();
+
+	if obj.is_err() || obj.iter().map(|o| o.status.success()).collect::<Vec<_>>() == vec![false] {
+		let stderr = if obj.is_ok() { String::from_utf8_lossy(&obj.unwrap().stderr).to_string() } else { "".to_string() };
+		Err(format!( "failure while executing git{}{}"
+			, args.iter().fold("".to_owned(), |a, e| format!("{} '{}'", a, e))
+			, stderr))
+	} else {
+		obj
+			.map_err(|e| format!("{:?}", e))
+			.and_then(|o| Ok(o.stdout))
+	}
 }
 
 fn make_mask(bits: usize) -> Vec<u8> {
@@ -150,14 +165,8 @@ fn matches_with_mask(v1: &[u8], v2: &[u8], mask: &[u8]) -> bool {
         v1.iter().zip(v2.iter()).zip(mask.iter()).all(|((h, p), m)| (*h&*m)^(*p&*m) == 0)
 }
 
-fn cur_hash() -> Result<String, std::io::Error> {
-        let cmd =
-                std::process::Command::new("git").args(&["rev-parse", "HEAD"])
-                .output()?;
-        if !cmd.status.success() {
-                panic!("Failed to get HEAD hash.");
-        }
-        Ok(String::from_utf8(cmd.stdout).map_err(|e| errmap("", &e))?.trim().to_owned())
+fn cur_hash(verbose: bool) -> Result<String, String> {
+	git(verbose, &["rev-parse", "HEAD"]).map(|o| String::from_utf8_lossy(&o).to_string())
 }
 
 #[derive(Debug)]
@@ -272,7 +281,7 @@ struct Possibility {
         committer: Offset,
 }
 
-fn brute_force(obj: Vec<u8>, winner_tx: std::sync::mpsc::Sender<Solution>, prefixbin: Vec<u8>, prefixbits: usize, shared: std::sync::Arc<(std::sync::atomic::AtomicBool, std::sync::atomic::AtomicI32, std::sync::Mutex<PossibilityIterator>)>) -> () {
+fn brute_force(obj: Vec<u8>, winner_tx: std::sync::mpsc::Sender<Solution>, prefixbin: Vec<u8>, prefixbits: usize, shared: std::sync::Arc<(std::sync::atomic::AtomicBool, std::sync::Mutex<PossibilityIterator>)>) -> () {
         let (before_author_date, author_date, between_dates, committer_date, after_committer_date) = parse_obj(&obj).expect("invalid git object description");
 
         let mut intro = format!("commit {}\0", obj.len()).as_bytes().to_owned();
@@ -370,12 +379,16 @@ fn brute_force(obj: Vec<u8>, winner_tx: std::sync::mpsc::Sender<Solution>, prefi
         //fn dump(tag: &str, b: &[u8]) { println!("{}: >{}<", tag, std::str::from_utf8(b).unwrap()); }
 	let mut ad = format!("{} {}", ad_base, tzformat(tzadd(adtz_base, 0))).into_bytes();
 	let mut cd = format!("{} {}", cd_base, tzformat(tzadd(cdtz_base, 0))).into_bytes();
-        while let Ok(Some(p)) = shared.2.lock().map(|mut possibilities| possibilities.next()) {
-                shared.1.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        while let Ok(Some(p)) = shared.1.lock().map(|mut possibilities| possibilities.next()) {
                 //println!("trying {:?}", p);
-                if ad_base + (p.author.time_offset as i64) < 0 || cd_base + (p.committer.time_offset as i64) < 0 {
+		let ad_utc = ad_base + p.author.time_offset as i64;
+		let cd_utc = cd_base + p.committer.time_offset as i64;
+		let ad_local = ad_base + p.author.time_offset as i64 + tzadd(adtz_base, p.author.timezone_offset) as i64;
+		let cd_local = cd_base + p.committer.time_offset as i64 + tzadd(cdtz_base, p.committer.timezone_offset) as i64;
+		if ad_local < 0 || cd_local < 0 || ad_utc < 0 || cd_utc < 0 {
                         continue;
                 }
+
 		if inplace_format(&mut ad, ad_base + p.author.time_offset as i64, tzadd(adtz_base, p.author.timezone_offset)).is_err() ||
 			inplace_format(&mut cd, cd_base + p.committer.time_offset as i64, tzadd(cdtz_base, p.committer.timezone_offset)).is_err() {
 			ad = format!("{} {}", ad_base + p.author.time_offset as i64, tzformat(tzadd(adtz_base, p.author.timezone_offset))).into_bytes();
