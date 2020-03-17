@@ -81,27 +81,31 @@ fn main() -> Result<(), std::io::Error> {
 
         let obj = obj.stdout;
 
-        let done = (std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0)));
-
-        let (possibilities_tx, possibilities_rx) = spmc::channel();
-        let feeder = {
-                let done = done.clone();
-                std::thread::spawn(move || {
-                        possibilities(possibilities_tx, timezone, timezone_minutes, force, done);
-                })
-        };
+	let mut pi = PossibilityIterator{
+			serial: 0,
+			possibility_counter: SplitInt::<u64>::zero(),
+			timezone: timezone,
+			timezone_minutes: timezone_minutes,
+	};
+	if force {
+		pi.next();
+	}
+        let shared = std::sync::Arc::new((
+		std::sync::atomic::AtomicBool::new(false),
+		std::sync::atomic::AtomicI32::new(0),
+		std::sync::Mutex::new(pi),
+	));
 
         let (winner_rx, forcers) = { // ensure winner_tx is dropped
                 let (winner_tx, winner_rx) = std::sync::mpsc::channel();
                 let mut forcers = Vec::new();
                 for _i in 0..cpu {
                         let tx = winner_tx.clone();
-                        let rx = possibilities_rx.clone();
                         let or = obj.clone();
-                        let pr = prefixbin.clone();
-                        let done = done.clone();
+                        let prefixbin = prefixbin.clone();
+                        let shared = shared.clone();
                         forcers.push(std::thread::spawn(move || {
-                                brute_force(or, tx, rx, pr, prefixbits, done)
+                                brute_force(or, tx, prefixbin, prefixbits, shared)
                         }));
                 }
                 (winner_rx, forcers)
@@ -111,8 +115,7 @@ fn main() -> Result<(), std::io::Error> {
         if verbose {
                 println!("{:?}", w);
         }
-        done.0.store(true, std::sync::atomic::Ordering::SeqCst);
-        feeder.join().map_err(|e| errmap("feeder join", &format!("{:?}", e)))?;
+        shared.0.store(true, std::sync::atomic::Ordering::SeqCst);
         for f in forcers.into_iter() {
                 f.join().map_err(|e| errmap("forcer join", &format!("{:?}", e)))?;
         }
@@ -203,31 +206,23 @@ impl Inc for u64 {
 	fn inc(&mut self) { *self += 1; }
 }
 
-fn possibilities(mut possibilities_tx: spmc::Sender<Possibility>, timezone: bool, timezone_minutes: bool, force: bool, done: (std::sync::Arc<std::sync::atomic::AtomicBool>, std::sync::Arc<std::sync::atomic::AtomicI32>)) {
-        let mut generated = 0;
-	let mut possibility_counter = SplitInt::<u64>::zero();
-	if force {
-		possibility_counter.i1.inc();
-	}
+struct PossibilityIterator {
+	serial: u64,
+	possibility_counter: SplitInt<u64>,
+	timezone: bool,
+	timezone_minutes: bool,
+}
 
-	'main:
-	loop {
-		let ao = Offset::from_u64(possibility_counter.i1, timezone, timezone_minutes);
-		let co = Offset::from_u64(possibility_counter.i2, timezone, timezone_minutes);
-		let next_possibility = Possibility{serial: generated, author: ao, committer: co};
+impl Iterator for PossibilityIterator {
+	type Item = Possibility;
+	fn next(&mut self) -> Option<Self::Item> {
+		let ao = Offset::from_u64(self.possibility_counter.i1, self.timezone, self.timezone_minutes);
+		let co = Offset::from_u64(self.possibility_counter.i2, self.timezone, self.timezone_minutes);
 
-		if possibilities_tx.send(next_possibility).is_err() || done.0.load(std::sync::atomic::Ordering::SeqCst) {
-			break 'main;
-		} else {
-			generated += 1;
-			let val = done.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-			if  val > 10000 {
-				std::thread::sleep(std::time::Duration::from_millis(val as u64 / 10000));
-				//println!("Overload! {}", val);
-			}
-		}
+		self.serial += 1;
+		self.possibility_counter.inc();
 
-		possibility_counter.i1.inc();
+		Some(Possibility{serial: self.serial, author: ao, committer: co})
 	}
 }
 
@@ -272,12 +267,12 @@ impl Offset {
 
 #[derive(Debug)]
 struct Possibility {
-        serial: u64,
+	serial: u64,
         author: Offset,
         committer: Offset,
 }
 
-fn brute_force(obj: Vec<u8>, winner_tx: std::sync::mpsc::Sender<Solution>, possibilities_rx: spmc::Receiver<Possibility>, prefixbin: Vec<u8>, prefixbits: usize, done: (std::sync::Arc<std::sync::atomic::AtomicBool>, std::sync::Arc<std::sync::atomic::AtomicI32>)) -> () {
+fn brute_force(obj: Vec<u8>, winner_tx: std::sync::mpsc::Sender<Solution>, prefixbin: Vec<u8>, prefixbits: usize, shared: std::sync::Arc<(std::sync::atomic::AtomicBool, std::sync::atomic::AtomicI32, std::sync::Mutex<PossibilityIterator>)>) -> () {
         let (before_author_date, author_date, between_dates, committer_date, after_committer_date) = parse_obj(&obj).expect("invalid git object description");
 
         let mut intro = format!("commit {}\0", obj.len()).as_bytes().to_owned();
@@ -375,8 +370,8 @@ fn brute_force(obj: Vec<u8>, winner_tx: std::sync::mpsc::Sender<Solution>, possi
         //fn dump(tag: &str, b: &[u8]) { println!("{}: >{}<", tag, std::str::from_utf8(b).unwrap()); }
 	let mut ad = format!("{} {}", ad_base, tzformat(tzadd(adtz_base, 0))).into_bytes();
 	let mut cd = format!("{} {}", cd_base, tzformat(tzadd(cdtz_base, 0))).into_bytes();
-        while let Ok(p) = possibilities_rx.recv() {
-                done.1.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        while let Ok(Some(p)) = shared.2.lock().map(|mut possibilities| possibilities.next()) {
+                shared.1.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 //println!("trying {:?}", p);
                 if ad_base + (p.author.time_offset as i64) < 0 || cd_base + (p.committer.time_offset as i64) < 0 {
                         continue;
@@ -419,7 +414,7 @@ fn brute_force(obj: Vec<u8>, winner_tx: std::sync::mpsc::Sender<Solution>, possi
                         s1.result(&mut hash);
                 }
 
-                if done.0.load(std::sync::atomic::Ordering::SeqCst) {
+                if shared.0.load(std::sync::atomic::Ordering::SeqCst) {
                         break;
                 }
 
