@@ -21,61 +21,49 @@
 // The gitbrute command brute-forces a git commit hash prefix.
 
 fn main() -> Result<(), std::io::Error> {
-        let matches = clap::App::new("gitbrute-rs").args_from_usage(
-                        "--prefix=<deadbeef> 'Desired prefix.'
-                        --prefix-bits=[13]    'Number of significant bits in the prefix.'
-                        --timezone           'Allow timezone modifications at 15 minutes granularity.'
-                        --timezone-minutes   'Allow timezone modifications at minute granularity.'
-                        --force              'Re-run, even if current hash matches prefix.'
-                        --verbose            'Issue diagnostic messages.'
-                        --cpus=[2]           'Number of CPUs to use. Defaults to number of processors.'")
-                .get_matches();
+	let (prefixbin, prefixmask, timezone, timezone_minutes, force, verbose, cpus) =
+		config()?;
 
-        let verbose = matches.is_present("verbose");
+	let (winner_rx, forcers, done) =
+		start_brute_force_threads(prefixbin, prefixmask, timezone, timezone_minutes, force, verbose, cpus)?;
 
-        let prefix = matches.value_of("prefix").expect("--prefix arg is mandatory, clap-rs should have already been None-checked it.");
-        if prefix.len() > 8 || prefix.chars().any(|c| !"0123456789abcdef".contains(c)) {
-                panic!("Invalid prefix.");
+	let winner = {
+		let _signal = done;
+
+        	winner_rx.recv().map_err(|e| errmap("winner recv failed: ", &e))?
+	};
+	
+	cleanup(verbose, winner, forcers)
+}
+
+fn cleanup(verbose: bool, winner: Solution, forcers: Vec<std::thread::JoinHandle<()>>) -> Result<(), std::io::Error> {
+        if verbose {
+                println!("{:?} (approx bits: {})", winner, std::mem::size_of_val(&winner.generated) * 8 - clz(winner.generated * 3 / 2, 0, 1) - 1);
         }
 
-        let prefixbits =
-                matches.value_of("prefix-bits")
-                .map(|s| s.parse().expect(&format!("wrong --prefix-bits value: {}", s)))
-                .unwrap_or(prefix.len()*4);
-
-        let prefixbin: Vec<_> = {
-                use rustc_hex::FromHex;
-                if prefix.len() % 2 == 1 {
-                        let mut s = prefix.to_owned();
-                        s.push('0');
-                        s
-                } else {
-                        prefix.to_owned()
-                }.from_hex().expect(&format!("Invalid hexa prefix: {}", prefix))
-        };
-
-        if (prefixbits + 3) / 4 != prefix.len() {
-                panic!("--prefix-bits don't correspond to prefix: ({} + 3) / 4 != {}", (prefixbits + 3) / 4, prefix.len());
+        for f in forcers.into_iter() {
+                f.join().map_err(|e| errmap("forcer join", &format!("{:?}", e)))?;
         }
 
-        let force = matches.is_present("force");
-        let timezone = matches.is_present("timezone");
-        let timezone_minutes = matches.is_present("timezone-minutes");
-        let cpu =
-                matches.value_of("cpus")
-                .map(|s| s.parse().expect(&format!("wrong cpus value: {}", s)))
-                .unwrap_or(num_cpus::get());
+	git_env(verbose, &["commit", "--allow-empty", "--amend", &format!("--date={}", winner.author), "--reuse-message=HEAD"], &vec![("GIT_COMMITTER_DATE".to_owned(), winner.committer)]).map_err(|s| errmap("Failed to amend git object.", &s))?;
 
-        if !force {
-                let hash: Vec<u8> = {use rustc_hex::FromHex; cur_hash(verbose).map_err(|e| errmap("Current hash", &e))?.from_hex().map_err(|e| errmap("HEAD hash parse", &e))?};
-                let mask = make_mask(prefixbits);
-                if matches_with_mask(&hash, &prefixbin, &mask) {
-                        return Ok(());
-                }
-        }
+	if verbose {
+		println!("new hash: {}", cur_hash(verbose).map_err(|e| errmap("new hash", &e))?);
+	}
 
-        let obj = git(verbose, &["cat-file", "-p", "HEAD"]).map_err(|e| errmap("failed to load git object for HEAD", &e))?;
+	Ok(())
+}
 
+fn clz<T: Clone + PartialEq + std::ops::ShrAssign>(mut v: T, z: T, one: T) -> usize {
+	let mut res = std::mem::size_of_val(&v) * 8;
+	while v != z {
+		res -= 1;
+		v >>= one.clone();
+	}
+	res
+}
+
+fn start_brute_force_threads(prefixbin: Vec<u8>, prefixmask: Vec<u8>, timezone: bool, timezone_minutes: bool, force: bool, verbose: bool, cpus: usize) -> Result<(std::sync::mpsc::Receiver<Solution>, std::vec::Vec<std::thread::JoinHandle<()>>, scopeguard::ScopeGuard<(), impl FnOnce(()) -> ()>), std::io::Error> {
 	let mut pi = PossibilityIterator{
 			serial: 0,
 			possibility_counter: SplitInt::<u64>::zero(),
@@ -85,41 +73,91 @@ fn main() -> Result<(), std::io::Error> {
 	if force {
 		pi.next();
 	}
-        let shared = std::sync::Arc::new((
-		std::sync::atomic::AtomicBool::new(false),
-		std::sync::Mutex::new(pi),
-	));
 
-        let (winner_rx, forcers) = { // ensure winner_tx is dropped
-                let (winner_tx, winner_rx) = std::sync::mpsc::channel();
-                let mut forcers = Vec::new();
-                for _i in 0..cpu {
-                        let tx = winner_tx.clone();
-                        let or = obj.clone();
-                        let prefixbin = prefixbin.clone();
-                        let shared = shared.clone();
-                        forcers.push(std::thread::spawn(move || {
-                                brute_force(or, tx, prefixbin, prefixbits, shared)
-                        }));
-                }
-                (winner_rx, forcers)
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let possibilities = std::sync::Arc::new(std::sync::Mutex::new(pi));
+
+        let obj = git(verbose, &["cat-file", "-p", "HEAD"]).map_err(|e| errmap("failed to load git object for HEAD", &e))?;
+
+	let (winner_tx, winner_rx) = std::sync::mpsc::channel();
+	let mut forcers = Vec::new();
+	for _ in 0..cpus {
+		let tx = winner_tx.clone();
+		let or = obj.clone();
+		let prefixbin = prefixbin.clone();
+		let prefixmask = prefixmask.clone();
+		let done = done.clone();
+		let possibilities = possibilities.clone();
+		forcers.push(std::thread::spawn(move || {
+			brute_force(or, tx, prefixbin, prefixmask, done, possibilities)
+		}));
+	}
+
+	Ok((
+		winner_rx,
+		forcers,
+		scopeguard::guard((), move |()| {
+			if verbose {
+				println!("setting done flag");
+			}
+			done.store(true, std::sync::atomic::Ordering::SeqCst);
+		})
+	))
+}
+
+fn config() -> Result<(Vec<u8>, Vec<u8>, bool, bool, bool, bool, usize), std::io::Error>{
+        let matches = clap::App::new("gitbrute-rs").args_from_usage(
+                        "--prefix=<deadbeef>     'Desired prefix.'
+                        --prefix-bits=[num]      'Number of significant bits in the prefix.'
+                        --prefix-mask=[ff008001] 'Bitmask of significant bits in the prefix.'
+                        --timezone               'Allow timezone modifications at 15 minutes granularity.'
+                        --timezone-minutes       'Allow timezone modifications at minute granularity.'
+                        --force                  'Re-run, even if current hash matches prefix.'
+                        --verbose                'Issue diagnostic messages.'
+                        --cpus=[num]             'Number of CPUs to use. Defaults to number of processors.'")
+                .get_matches();
+
+        let verbose = matches.is_present("verbose");
+
+        let prefix = matches.value_of("prefix").expect("--prefix arg is mandatory, clap-rs should have already been None-checked it.");
+        if prefix.len() > 40 || prefix.chars().any(|c| !"0123456789abcdef".contains(c)) {
+		return Err(errmap("Invalid prefix.", &""));
+        }
+
+        let prefixbits =
+                matches.value_of("prefix-bits")
+                .map(|s| s.parse().expect(&format!("wrong --prefix-bits value: {}", s)))
+                .unwrap_or(prefix.len()*4);
+
+	let prefixmask =
+		matches.value_of("prefix-mask")
+		.map(|s| rustc_hex::FromHex::from_hex(s).expect(&format!("wrong --prefix-mask value: {}", s)))
+		.unwrap_or(make_mask(prefixbits));
+
+	let prefixmask = prefixmask.into_iter().zip(make_mask(prefixbits)).map(|(pm, bm)| pm&bm).collect::<Vec<_>>();
+		
+
+        let prefixbin: Vec<_> = {
+		let mut padded_prefix = prefix.to_owned();
+		if prefix.len() % 2 == 1 {
+			padded_prefix.push('0');
+		};
+                rustc_hex::FromHex::from_hex(padded_prefix.as_str()).expect(&format!("Invalid hexa prefix: {}", prefix))
         };
 
-        let w = winner_rx.recv().map_err(|e| errmap("winner recv failed: ", &e))?;
-        if verbose {
-                println!("{:?}", w);
-        }
-        shared.0.store(true, std::sync::atomic::Ordering::SeqCst);
-        for f in forcers.into_iter() {
-                f.join().map_err(|e| errmap("forcer join", &format!("{:?}", e)))?;
+        if (prefixbits + 3) / 4 != prefix.len() {
+                return Err(errmap("--prefix-bits don't correspond to prefix length", &format!(": ({} + 3) / 4 != {}", (prefixbits + 3) / 4, prefix.len())));
         }
 
-	git_env(verbose, &["commit", "--allow-empty", "--amend", &format!("--date={}", w.author), "--reuse-message=HEAD"], &vec![("GIT_COMMITTER_DATE".to_owned(), w.committer)]).map_err(|s| errmap("Failed to amend git object.", &s))?;
+        let force = matches.is_present("force");
+        let timezone = matches.is_present("timezone");
+        let timezone_minutes = matches.is_present("timezone-minutes");
+        let cpus =
+                matches.value_of("cpus")
+                .map(|s| s.parse().expect(&format!("wrong cpus value: {}", s)))
+                .unwrap_or(num_cpus::get());
 
-	if verbose {
-		println!("new hash: {}", cur_hash(verbose).map_err(|e| errmap("new hash", &e))?);
-	}
-	Ok(())
+	Ok((prefixbin, prefixmask, timezone, timezone_minutes, force, verbose, cpus))
 }
 
 fn git(verbose: bool, args: &[&str]) -> Result<Vec<u8>, String> {
@@ -175,12 +213,22 @@ struct SplitInt<T> {
 	i2: T,
 }
 
-trait Zero {
+trait /*std::num::*/Zero {
 	fn zero() -> Self;
+}
+
+trait /*std::num::*/One {
+	fn one() -> Self;
 }
 
 trait Inc {
 	fn inc(&mut self) -> ();
+}
+
+impl <T: One + std::ops::AddAssign> Inc for T {
+	fn inc(&mut self) -> () {
+		*self += T::one();
+	}
 }
 
 impl <T: Zero> Zero for SplitInt<T> {
@@ -207,13 +255,8 @@ impl <T: Inc + Zero + Clone + PartialOrd> Inc for SplitInt<T> {
 	}
 }
 
-impl Zero for u64 {
-	fn zero() -> Self { 0 }
-}
-
-impl Inc for u64 {
-	fn inc(&mut self) { *self += 1; }
-}
+impl Zero for u64 { fn zero() -> Self { 0 } }
+impl One  for u64 { fn one()  -> Self { 1 } }
 
 struct PossibilityIterator {
 	serial: u64,
@@ -281,7 +324,7 @@ struct Possibility {
         committer: Offset,
 }
 
-fn brute_force(obj: Vec<u8>, winner_tx: std::sync::mpsc::Sender<Solution>, prefixbin: Vec<u8>, prefixbits: usize, shared: std::sync::Arc<(std::sync::atomic::AtomicBool, std::sync::Mutex<PossibilityIterator>)>) -> () {
+fn brute_force(obj: Vec<u8>, winner_tx: std::sync::mpsc::Sender<Solution>, prefixbin: Vec<u8>, prefixmask: Vec<u8>, done: std::sync::Arc<std::sync::atomic::AtomicBool>, possibilities: std::sync::Arc<std::sync::Mutex<PossibilityIterator>>) -> () {
         let (before_author_date, author_date, between_dates, committer_date, after_committer_date) = parse_obj(&obj).expect("invalid git object description");
 
         let mut intro = format!("commit {}\0", obj.len()).as_bytes().to_owned();
@@ -368,7 +411,6 @@ fn brute_force(obj: Vec<u8>, winner_tx: std::sync::mpsc::Sender<Solution>, prefi
 	}
 
         let mut s1 = crypto::sha1::Sha1::new();
-        let mask: Vec<u8> = make_mask(prefixbits);
 
         fn splice(dst: &mut [u8], offset: usize, src: &[u8]) {
                 for (d, s) in dst.iter_mut().skip(offset).zip(src.iter()) {
@@ -379,7 +421,7 @@ fn brute_force(obj: Vec<u8>, winner_tx: std::sync::mpsc::Sender<Solution>, prefi
         //fn dump(tag: &str, b: &[u8]) { println!("{}: >{}<", tag, std::str::from_utf8(b).unwrap()); }
 	let mut ad = format!("{} {}", ad_base, tzformat(tzadd(adtz_base, 0))).into_bytes();
 	let mut cd = format!("{} {}", cd_base, tzformat(tzadd(cdtz_base, 0))).into_bytes();
-        while let Ok(Some(p)) = shared.1.lock().map(|mut possibilities| possibilities.next()) {
+        while let Ok(Some(p)) = possibilities.lock().map(|mut possibilities| possibilities.next()) {
                 //println!("trying {:?}", p);
 		let ad_utc = ad_base + p.author.time_offset as i64;
 		let cd_utc = cd_base + p.committer.time_offset as i64;
@@ -427,11 +469,11 @@ fn brute_force(obj: Vec<u8>, winner_tx: std::sync::mpsc::Sender<Solution>, prefi
                         s1.result(&mut hash);
                 }
 
-                if shared.0.load(std::sync::atomic::Ordering::SeqCst) {
+                if done.load(std::sync::atomic::Ordering::SeqCst) {
                         break;
                 }
 
-                if matches_with_mask(&hash, &prefixbin, &mask) {
+                if matches_with_mask(&hash, &prefixbin, &prefixmask) {
                         let winner = Solution{generated: p.serial, author: format!("@{}", String::from_utf8(ad).unwrap()), committer: format!("@{}", String::from_utf8(cd).unwrap())};
                         //println!("winner found: {:?}", winner);
                         winner_tx.send(winner).expect("failed to send result");
