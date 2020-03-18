@@ -291,21 +291,22 @@ struct Offset {
         timezone_offset: i32,
 }
 
-const TZMOD: u64 = 1+(12*60-1)*2; // {zero} U {+/- almost twelve hours}
-const TZMODQ: u64 = 1+(12*4-1)*2; // {zero} U {+/- almost twelve hours in quarter hour steps}
+const TZMODH: u64 = 1; // no timezones
+const TZMODQ: u64 = 2*12*4 - 1; // +/- twelve hours in quarter hour steps, minus the full circle
+const TZMODM: u64 = 2*12*60 - 1; // +/- twelve hours, minus the full circle
 impl Offset {
 	fn from_u64(v: u64, timezone: bool, timezone_minutes: bool) -> Offset {
 		let (modulus, tzmultiplier) =
 			if timezone_minutes {
-				(TZMOD, 1)
+				(TZMODM, 1)
 			} else if timezone {
 				(TZMODQ, 15)
 			} else {
-				(1, 1)
+				(TZMODH, 60/*irrelevant, as tz is 0 in this case*/)
 			};
 			
-		let tz = (v + 1) % modulus;
-		let t  = (v + 1) / modulus;
+		let tz = v % modulus + 1;
+		let t  = v / modulus + 1;
 		fn parity_sign(v: u64) -> i32 {
 			if v % 2 == 0 {
 				(v >> 1) as i32
@@ -378,29 +379,26 @@ fn brute_force(obj: Vec<u8>, winner_tx: std::sync::mpsc::Sender<Solution>, prefi
                 format!("{}{:0>2}{:0>2}", if tz < 0 { '-' } else { '+' }, ptz / 60, ptz % 60)
         }
 
-	fn inplace_format(dest: &mut [u8], mut time: i64, mut tz: i32) -> Result<(), ()> {
-		let sign = if tz < 0 { b'-' } else { b'+' };
-		tz = tz.abs();
+	fn tz_inplace(dest: &mut [u8], tz: i32) {
+		dest[dest.len() - 5] = if tz < 0 { b'-' } else { b'+' };
+		let tz = tz.abs();
+		dest[dest.len() - 4] = b'0' + (tz / 60 / 10) as u8;
+		dest[dest.len() - 3] = b'0' + (tz / 60 % 10) as u8;
+		dest[dest.len() - 2] = b'0' + (tz % 60 / 10) as u8;
+		dest[dest.len() - 1] = b'0' + (tz % 10) as u8;
+	}
 
-		for i in 0..dest.len() {
-			       if i == dest.len() - 1 {
-				dest[i] = b'0' + (tz % 10) as u8;
-			} else if i == dest.len() - 2 {
-				dest[i] = b'0' + (tz % 60 / 10) as u8;
-			} else if i == dest.len() - 3 {
-				dest[i] = b'0' + (tz / 60 % 10) as u8;
-			} else if i == dest.len() - 4 {
-				dest[i] = b'0' + (tz / 60 / 10) as u8;
-			} else if i == dest.len() - 5 {
-				dest[i] = sign;
-			} else if i == dest.len() - 6 {
-			} else {
-				if time == 0 {
-					return Err(());
-				}
-				dest[dest.len() - i - 7] = b'0' + (time % 10) as u8;
-				time /= 10;
+	fn inplace_format(dest: &mut [u8], mut time: i64, tz: i32) -> Result<(), ()> {
+		tz_inplace(dest, tz);
+
+		for i in 0..dest.len() - 6 {
+			if time == 0 {
+				return Err(());
 			}
+
+			dest[dest.len() - i - 7] = b'0' + (time % 10) as u8;
+
+			time /= 10;
 		}
 
 		if time != 0 {
@@ -421,21 +419,34 @@ fn brute_force(obj: Vec<u8>, winner_tx: std::sync::mpsc::Sender<Solution>, prefi
         //fn dump(tag: &str, b: &[u8]) { println!("{}: >{}<", tag, std::str::from_utf8(b).unwrap()); }
 	let mut ad = format!("{} {}", ad_base, tzformat(tzadd(adtz_base, 0))).into_bytes();
 	let mut cd = format!("{} {}", cd_base, tzformat(tzadd(cdtz_base, 0))).into_bytes();
+	let mut ad_utc_prev = ad_base;
+	let mut cd_utc_prev = cd_base;
         while let Ok(Some(p)) = possibilities.lock().map(|mut possibilities| possibilities.next()) {
                 //println!("trying {:?}", p);
 		let ad_utc = ad_base + p.author.time_offset as i64;
 		let cd_utc = cd_base + p.committer.time_offset as i64;
-		let ad_local = ad_base + p.author.time_offset as i64 + tzadd(adtz_base, p.author.timezone_offset) as i64;
-		let cd_local = cd_base + p.committer.time_offset as i64 + tzadd(cdtz_base, p.committer.timezone_offset) as i64;
+		let ad_tz = tzadd(adtz_base, p.author.timezone_offset);
+		let cd_tz = tzadd(cdtz_base, p.committer.timezone_offset);
+		let ad_local = ad_utc + ad_tz as i64;
+		let cd_local = cd_utc + cd_tz as i64;
 		if ad_local < 0 || cd_local < 0 || ad_utc < 0 || cd_utc < 0 {
                         continue;
                 }
 
-		if inplace_format(&mut ad, ad_base + p.author.time_offset as i64, tzadd(adtz_base, p.author.timezone_offset)).is_err() ||
-			inplace_format(&mut cd, cd_base + p.committer.time_offset as i64, tzadd(cdtz_base, p.committer.timezone_offset)).is_err() {
-			ad = format!("{} {}", ad_base + p.author.time_offset as i64, tzformat(tzadd(adtz_base, p.author.timezone_offset))).into_bytes();
-			cd = format!("{} {}", cd_base + p.committer.time_offset as i64, tzformat(tzadd(cdtz_base, p.committer.timezone_offset))).into_bytes();
+		if ad_utc_prev / 10 == ad_utc / 10 && cd_utc_prev / 10 == cd_utc / 10 {
+			let ads: &mut [u8] = &mut ad;
+			let cds: &mut [u8] = &mut cd;
+			ads[ads.len() - 1 - 5 - 1] = b'0' + (ad_utc % 10) as u8;
+			cds[cds.len() - 1 - 5 - 1] = b'0' + (cd_utc % 10) as u8;
+			tz_inplace(&mut ad, ad_tz);
+			tz_inplace(&mut cd, cd_tz);
+		} else if inplace_format(&mut ad, ad_utc, ad_tz).is_err() ||
+				inplace_format(&mut cd, cd_utc, cd_tz).is_err() {
+			ad = format!("{} {}", ad_utc, tzformat(ad_tz)).into_bytes();
+			cd = format!("{} {}", cd_utc, tzformat(cd_tz)).into_bytes();
 		}
+		ad_utc_prev = ad_utc;
+		cd_utc_prev = cd_utc;
 
                 if ad.len() == adlen && cd.len() == cdlen {
                         splice(&mut blob, cdatei, &cd);
