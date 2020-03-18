@@ -9,6 +9,7 @@ clap = "2"
 num_cpus = "1"
 rust-crypto = "0.2"
 rustc-hex = "2"
+scopeguard = "1"
 
 [[bin]]
 name = "gitbrute-rs"
