@@ -75,7 +75,7 @@ fn start_brute_force_threads(prefixbin: Vec<u8>, prefixmask: Vec<u8>, timezone: 
 	}
 
         let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let possibilities = std::sync::Arc::new(std::sync::Mutex::new(pi));
+        let possibilities = std::sync::Arc::new(std::sync::Mutex::new(Chunk::new(pi, 5*cpus)));
 
         let obj = git(verbose, &["cat-file", "-p", "HEAD"]).map_err(|e| errmap("failed to load git object for HEAD", &e))?;
 
@@ -103,6 +103,24 @@ fn start_brute_force_threads(prefixbin: Vec<u8>, prefixmask: Vec<u8>, timezone: 
 			done.store(true, std::sync::atomic::Ordering::SeqCst);
 		})
 	))
+}
+
+struct Chunk<T, I: Iterator<Item=T>> {
+    target: I,
+    step: usize,
+}
+
+impl <T, I: Iterator<Item=T>> Chunk<T, I> {
+    fn new(target: I, step: usize) -> Self {
+        Chunk{target: target, step: step}
+    }
+}
+
+impl <T, I: Iterator<Item=T>> Iterator for Chunk<T, I> {
+    type Item = Vec<T>;
+    fn next(&mut self) -> Option<Self::Item> {
+        Some((0..self.step).zip(&mut self.target).map(|(_, e)| e).collect())
+    }
 }
 
 fn config() -> Result<(Vec<u8>, Vec<u8>, bool, bool, bool, bool, usize), std::io::Error>{
@@ -325,8 +343,16 @@ struct Possibility {
         committer: Offset,
 }
 
-fn brute_force(obj: Vec<u8>, winner_tx: std::sync::mpsc::Sender<Solution>, prefixbin: Vec<u8>, prefixmask: Vec<u8>, done: std::sync::Arc<std::sync::atomic::AtomicBool>, possibilities: std::sync::Arc<std::sync::Mutex<PossibilityIterator>>) -> () {
-        let (before_author_date, author_date, between_dates, committer_date, after_committer_date) = parse_obj(&obj).expect("invalid git object description");
+fn brute_force(
+        obj: Vec<u8>,
+        winner_tx: std::sync::mpsc::Sender<Solution>,
+        prefixbin: Vec<u8>,
+        prefixmask: Vec<u8>,
+        done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        possibilities: std::sync::Arc<std::sync::Mutex<impl Iterator<Item=Vec<Possibility>>>>
+) -> () {
+        let (before_author_date, author_date, between_dates, committer_date, after_committer_date) =
+            parse_obj(&obj).expect("invalid git object description");
 
         let mut intro = format!("commit {}\0", obj.len()).as_bytes().to_owned();
 
@@ -421,7 +447,9 @@ fn brute_force(obj: Vec<u8>, winner_tx: std::sync::mpsc::Sender<Solution>, prefi
 	let mut cd = format!("{} {}", cd_base, tzformat(tzadd(cdtz_base, 0))).into_bytes();
 	let mut ad_utc_prev = ad_base;
 	let mut cd_utc_prev = cd_base;
-        while let Ok(Some(p)) = possibilities.lock().map(|mut possibilities| possibilities.next()) {
+        'chunk:
+        while let Ok(Some(pv)) = possibilities.lock().map(|mut possibilities| possibilities.next()) {
+            for p in pv.into_iter() {
                 //println!("trying {:?}", p);
 		let ad_utc = ad_base + p.author.time_offset as i64;
 		let cd_utc = cd_base + p.committer.time_offset as i64;
@@ -481,17 +509,22 @@ fn brute_force(obj: Vec<u8>, winner_tx: std::sync::mpsc::Sender<Solution>, prefi
                 }
 
                 if done.load(std::sync::atomic::Ordering::SeqCst) {
-                        break;
+                        break 'chunk;
                 }
 
                 if matches_with_mask(&hash, &prefixbin, &prefixmask) {
-                        let winner = Solution{generated: p.serial, author: format!("@{}", String::from_utf8(ad).unwrap()), committer: format!("@{}", String::from_utf8(cd).unwrap())};
+                        let winner = Solution{
+                            generated: p.serial,
+                            author: format!("@{}", String::from_utf8(ad).unwrap()),
+                            committer: format!("@{}", String::from_utf8(cd).unwrap())
+                        };
                         //println!("winner found: {:?}", winner);
                         winner_tx.send(winner).expect("failed to send result");
-                        break;
+                        break 'chunk;
                 } else {
                         //{use rustc_hex::ToHex;println!("wrong hash: {} serial {}", hash.to_hex::<String>(), p.serial);}
                 }
+            }
         }
         //println!("No more possibilities.");
 }
