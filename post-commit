@@ -1,0 +1,35 @@
+#! /bin/bash
+
+if [ -n "$SKIPBRUTE" ]; then
+	exit 0
+fi
+export SKIPBRUTE=y
+
+unset GIT_COMMITTER_DATE
+
+prev=`git rev-parse HEAD^`
+
+if [ -z "$prev" ]; then
+	n=0
+	sep=a
+else
+	n=`echo $prev | sed -e 's/^0*//' -e 's/[^0-9].*//'`
+	sep=`echo $prev | sed -e 's/[0-9]*\(.\).*/\1/'`
+	if [ $((n+0)) -ge 999 ]; then
+		sep=0x$sep
+		if [ $((sep)) = 15 ]; then
+			echo Too many resources for a joke. >&2
+			exit 1
+		else
+			sep=$((sep+1))
+			sep=`printf %x $sep`
+		fi
+		n=0
+	else
+		n=$((n+1))
+	fi
+fi
+
+tgt=`printf %03d$sep $n`
+
+gitbrute-rs --prefix $tgt
