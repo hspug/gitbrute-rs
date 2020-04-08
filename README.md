@@ -24,3 +24,11 @@ OPTIONS:
         --prefix <deadbeef>    Desired prefix.
         --prefix-bits <13>     Number of significant bits in the prefix.
 ```
+
+Cleaning leftover commits
+-------------------------
+```
+$ SKIPBRUTE=y git rebase -i --exec 'gitbrute-rs --prefix a' <first non numbered commit>
+$ git reflog expire --expire=0 --all
+$ git gc --prune=now
+```
